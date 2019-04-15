@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using HtmlAgilityPack;
 using MarkdownDeep;
+using Raven.Documentation.Parser.Compilation.Parsing;
 using Raven.Documentation.Parser.Data;
 using Raven.Documentation.Parser.Helpers;
 
@@ -29,7 +30,7 @@ namespace Raven.Documentation.Parser.Compilation
                 Category = parameters.Category,
                 Images = parameters.Images,
                 LastCommitSha = parameters.LastCommitSha,
-                RelativePath = parameters.RelativePath,
+                RelativePath = parameters.RepositoryRelativePath,
                 Mappings = parameters.Mappings,
                 Metadata = parameters.Metadata,
                 SeoMetaProperties = parameters.SeoMetaProperties,
@@ -42,16 +43,16 @@ namespace Raven.Documentation.Parser.Compilation
     public abstract class DocumentCompiler<TPage> where TPage : DocumentationPage
     {
         private readonly Markdown _parser;
-
         protected readonly ParserOptions Options;
+        private readonly RepositoryDataRetriever _repositoryDataRetriever;
 
-        private readonly IProvideGitFileInformation _repoAnalyzer;
+        private readonly TextContentParser _textContentParser = new TextContentParser();
 
         protected DocumentCompiler(Markdown parser, ParserOptions options, IProvideGitFileInformation repoAnalyzer)
         {
             _parser = parser;
             Options = options;
-            _repoAnalyzer = repoAnalyzer;
+            _repositoryDataRetriever = new RepositoryDataRetriever(repoAnalyzer);
         }
 
         protected abstract TPage CreatePage(CreatePageParams parameters);
@@ -67,7 +68,7 @@ namespace Raven.Documentation.Parser.Compilation
             public Category Category { get; set; }
             public HashSet<DocumentationImage> Images { get; set; }
             public string LastCommitSha { get; set; }
-            public string RelativePath { get; set; }
+            public string RepositoryRelativePath { get; set; }
             public List<DocumentationMapping> Mappings { get; set; }
             public string RelatedArticlesContent { get; set; }
             public Dictionary<string, string> Metadata { get; set; }
@@ -102,23 +103,13 @@ namespace Raven.Documentation.Parser.Compilation
 
                 var htmlDocument = HtmlHelper.ParseHtml(content);
 
-                ProcessNonMarkdownImages(file, documentationVersion, page.Language, htmlDocument, images, key);
-
                 var title = ExtractTitle(page, htmlDocument);
 
                 ValidateTitle(title);
 
-                var textContent = ExtractTextContent(htmlDocument, out var relatedArticlesContent);
+                var textContentResult = _textContentParser.Extract(htmlDocument);
 
-                var caseSensitiveFileName = PathHelper.GetProperFilePathCapitalization(file.FullName);
-
-                var fullName = caseSensitiveFileName ?? file.FullName;
-
-                var repoRelativePath = _repoAnalyzer.MakeRelativePathInRepository(fullName);
-
-                var relativeUrl = repoRelativePath.Replace(@"\", @"/");
-
-                var lastCommit = _repoAnalyzer.GetLastCommitThatAffectedFile(repoRelativePath);
+                var repositoryData = _repositoryDataRetriever.GetForFile(file.FullName);
 
                 var createPageParams = new CreatePageParams
                 {
@@ -126,14 +117,14 @@ namespace Raven.Documentation.Parser.Compilation
                     Title = title,
                     DocumentationVersion = documentationVersion,
                     HtmlContent = htmlDocument.DocumentNode.OuterHtml,
-                    TextContent = textContent,
+                    TextContent = textContentResult.TextContent,
                     Language = page.Language,
                     Category = category,
                     Images = images,
-                    LastCommitSha = lastCommit,
-                    RelativePath = relativeUrl,
+                    LastCommitSha = repositoryData.LastCommitSha,
+                    RepositoryRelativePath = repositoryData.RepositoryRelativePath,
                     Mappings = mappings.OrderBy(x => x.Version).ToList(),
-                    RelatedArticlesContent = relatedArticlesContent,
+                    RelatedArticlesContent = textContentResult.RelatedArticlesHtmlContent,
                     Metadata = page.Metadata,
                     SeoMetaProperties = page.SeoMetaProperties,
                     DiscussionId = page.DiscussionId
@@ -144,46 +135,6 @@ namespace Raven.Documentation.Parser.Compilation
             catch (Exception e)
             {
                 throw new InvalidOperationException(string.Format("Could not compile '{0}'.", file.FullName), e);
-            }
-        }
-
-        private void ProcessNonMarkdownImages(FileInfo file, string documentationVersion, Language lang, HtmlDocument htmlDocument,
-            HashSet<DocumentationImage> images, string key)
-        {
-            var nonMarkdownImages = htmlDocument.DocumentNode.SelectNodes("//img[starts-with(@src, 'images/')]");
-            if (nonMarkdownImages == null)
-            {
-                return;
-            }
-
-            foreach (var node in nonMarkdownImages)
-            {
-                AddNonMarkdownImage(images, file.DirectoryName, Options.ImageUrlGenerator, documentationVersion, lang, node, key);
-            }
-        }
-
-        private static void AddNonMarkdownImage(ICollection<DocumentationImage> images, string directory,
-            ParserOptions.GenerateImageUrl generateImageUrl, string documentationVersion, Language lang, HtmlNode node, string key)
-        {
-            if (node.Attributes.Contains("src"))
-            {
-                string src = node.Attributes["src"].Value;
-                var imagePath = Path.Combine(directory, src);
-
-                src = src.Replace('\\', '/');
-                if (src.StartsWith("images/", StringComparison.InvariantCultureIgnoreCase))
-                    src = src.Substring(7);
-
-                var fileName = Path.GetFileName(src);
-                var imageUrl = generateImageUrl(documentationVersion, lang, key, fileName);
-
-                node.SetAttributeValue("src", imageUrl);
-
-                images.Add(new DocumentationImage
-                {
-                    ImagePath = imagePath,
-                    ImageKey = $"{documentationVersion}/{src}"
-                });
             }
         }
 
@@ -237,36 +188,6 @@ namespace Raven.Documentation.Parser.Compilation
             }
 
             return key;
-        }
-
-        private static string ExtractTextContent(HtmlDocument htmlDocument, out string relatedArticlesHtmlContent)
-        {
-            var relatedArticles =
-                htmlDocument.DocumentNode.ChildNodes.FirstOrDefault(
-                    x => x.InnerText.Equals("Related articles", StringComparison.OrdinalIgnoreCase));
-
-            if (relatedArticles == null)
-            {
-                relatedArticlesHtmlContent = null;
-                return htmlDocument.DocumentNode.InnerText;
-            }
-
-            var nodeToRemove = relatedArticles;
-            var nodesToRemove = new List<HtmlNode>();
-            while (nodeToRemove != null)
-            {
-                nodesToRemove.Add(nodeToRemove);
-                nodeToRemove = nodeToRemove.NextSibling;
-            }
-
-            foreach (var node in nodesToRemove)
-            {
-                htmlDocument.DocumentNode.RemoveChild(node);
-            }
-
-            relatedArticlesHtmlContent = string.Join(Environment.NewLine, nodesToRemove.Skip(1).Select(x => x.OuterHtml));
-
-            return htmlDocument.DocumentNode.InnerText;
         }
         
         protected virtual string ExtractTitle(FolderItem page, HtmlDocument htmlDocument)

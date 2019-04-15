@@ -29,7 +29,7 @@ namespace Raven.Documentation.Parser
                 Category = parameters.Category,
                 Images = parameters.Images,
                 LastCommitSha = parameters.LastCommitSha,
-                RelativePath = parameters.RelativePath,
+                RelativePath = parameters.RepositoryRelativePath,
                 Mappings = parameters.Mappings,
                 Metadata = parameters.Metadata,
                 SeoMetaProperties = parameters.SeoMetaProperties
